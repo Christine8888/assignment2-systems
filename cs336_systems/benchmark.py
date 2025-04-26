@@ -12,7 +12,8 @@ import einops
 from contextlib import nullcontext
 
 nvtx_profile = False
-memory_profile = True
+memory_profile = False
+jit_compile = False
 
 if nvtx_profile:
     # only replace implementations if nvtx_profile is True
@@ -36,6 +37,9 @@ def nvtx_range(name):
 def benchmark_model(model_params: dict, optimizer_params: dict, train_params: dict, dataset: np.array, warmup: int, n_steps: int, model_size: str):
     device = train_params["device"]
     lm = model.BasicsTransformerLM(**model_params).to(device)
+    if jit_compile:
+        lm = torch.compile(lm)
+    
     optim = optimizer.AdamW(lm.parameters(), **optimizer_params)
     use_amp = train_params["mixed_precision"]
 
@@ -82,15 +86,14 @@ def benchmark_model(model_params: dict, optimizer_params: dict, train_params: di
                     loss = nn_utils.cross_entropy(logits, y_data)
                     loss.backward()
                     torch.cuda.synchronize()
-
-            if train_params["include_backward"]:
-                end_time = timeit.default_timer()
             
             # optimizer step
-            if train_params["include_adam"]:
-                with nvtx_range("optimizer step"):
-                    optim.step()
-                    optim.zero_grad(set_to_none = True)
+            with nvtx_range("optimizer step"):
+                optim.step()
+                optim.zero_grad(set_to_none = True)
+            
+            if train_params["include_backward"]: # also include adam step
+                end_time = timeit.default_timer()
             
             if memory_profile and train_params["include_backward"]: # end here for full step
                 torch.cuda.memory._dump_snapshot(f"{model_size}_fullstep_{model_params['context_length']}_{train_params['mixed_precision']}.pickle")
@@ -114,7 +117,6 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--n_steps", type=int, default=10)
     parser.add_argument("--include_backward", default=False, action="store_true")
-    parser.add_argument("--include_adam", default=False, action="store_true")
     parser.add_argument("--model_size", type=str, default="all")
     parser.add_argument("--mixed_precision", default=False, action="store_true")
     parser.add_argument("--amp_dtype", type=str, default="bfloat16")
@@ -141,7 +143,6 @@ def get_default_dicts(args):
         "batch_size": args.batch_size,
         "device": args.device,
         "include_backward": args.include_backward,
-        "include_adam": args.include_adam,
         "mixed_precision": args.mixed_precision,
         "amp_dtype": args.amp_dtype,
     }
@@ -184,11 +185,12 @@ def main(args, save_times = False):
 
     for model_size in model_sizes:
         results.loc[model_size] = run_benchmark(model_size, args, adamw_params, train_params, data)
-        
+    
+    print(results.to_markdown())
+
     # save results to txt as markdown table
     if save_times:
-        with open(f"warmup_{args.warmup}_backward_{args.include_backward}.txt", "w") as f:
-            print(results.to_markdown())
+        with open(f"warmup_{args.warmup}_backward_{args.include_backward}_{'jit' if jit_compile else 'nojit'}.txt", "w") as f:
             f.write(results.to_markdown())
 
 if __name__ == "__main__":
