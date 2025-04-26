@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
 
+import torch.cuda.nvtx as nvtx
 
 from .nn_utils import softmax
 
@@ -432,6 +433,30 @@ def scaled_dot_product_attention(
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    d_k = K.shape[-1]
+
+    with nvtx.range("attn matmul"   ):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+
+    if mask is not None:
+        with nvtx.range("masking"):
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+    with nvtx.range("softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    with nvtx.range("final matmul"):
+        result = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+    return result
+
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention
 
@@ -474,6 +499,50 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self.output_proj = Linear(self.num_heads * self.d_v, self.d_model)
 
         self.positional_encoder = positional_encoder  # RoPE
+
+    @nvtx.range("causal multi-head self-attention forward")
+    def annotated_forward(self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None) -> Float[Tensor, " ... seq d_v"]:
+        *b, sequence_length, d_model = x.size()
+        assert d_model == self.d_model
+
+        with nvtx.range("qkv projection"):
+            Q = self.q_proj(x)
+            K = self.k_proj(x)
+            V = self.v_proj(x)
+
+        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
+        Q, K, V = (
+            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
+            for X in (Q, K, V)
+        )  # fmt: skip
+
+        if token_positions is None:
+            token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
+
+        # Duplicate token positions for each head
+        token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
+
+        Q = self.positional_encoder(Q, token_positions)
+        K = self.positional_encoder(K, token_positions)
+
+        # Construct causal mask
+        seq = torch.arange(sequence_length, device=x.device)
+        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
+        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+        causal_mask = qi >= kj  # (query, key)
+
+        # Shape: (..., num_heads, sequence_length, d_k)
+        with nvtx.range("scaled dot product attention"):
+            attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+
+        # Concatenate the attention output from all heads.
+        # (..., sequence_length, num_heads * d_v).
+        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
+
+        # Apply the output projection
+        with nvtx.range("output projection"):
+            output = self.output_proj(attn_output)
+        return output
 
     def forward(self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None) -> Float[Tensor, " ... seq d_v"]:
         """
