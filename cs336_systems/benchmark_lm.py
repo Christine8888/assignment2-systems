@@ -163,7 +163,6 @@ def get_default_dicts(args):
 
 def launch_model(args, adamw_params, train_params, dataset, train_flag = "vanilla"):
     model_size = train_params["model_size"]
-
     print(f"benchmarking {train_params['model_size']}...")
 
     # vary only d_model, num_layers, num_heads, and d_ff
@@ -219,6 +218,7 @@ def run_time(args, dataset, save_times = False, to_save = ["forward_mean", "forw
 
 
 def ddp_worker(rank, args, adamw_params, train_params, dataset, shared, train_flag):
+    print('running ddp_worker with train_flag:', train_flag, 'and n_procs:', args.n_procs)
     os.environ["LOCAL_RANK"] = str(rank)
     # must set seeds here, otherwise will get different results on different processes
     set_seeds()
@@ -236,6 +236,7 @@ def ddp_worker(rank, args, adamw_params, train_params, dataset, shared, train_fl
     
     
 def run_train(args, train_flag = "vanilla"):
+    print('running run_train with train_flag:', train_flag, 'and n_procs:', args.n_procs)
     adamw_params, train_params = get_default_dicts(args)
     dataset = np.random.randint(0, args.vocab_size, size = args.context_length * 10)
 
@@ -256,8 +257,10 @@ def run_train(args, train_flag = "vanilla"):
     return collect_times, time_per_step, dataset, final_model
 
 def test_ddp(args, compare_weights = False, train_flag = "flattened", comparison_flag = "simplest"):
+    print('running test_ddp')
     set_seeds()
     collect_times_naive, time_per_step_naive, data_naive, naive_lm = run_train(args, train_flag = train_flag)
+    print('finished training')
 
     if compare_weights:
         set_seeds()
@@ -284,6 +287,8 @@ def test_ddp(args, compare_weights = False, train_flag = "flattened", comparison
             print("✅ same weights")
         else:
             print("❌ weights differ")
+
+        del vanilla_lm
     
 
     results = pd.DataFrame({
@@ -304,11 +309,16 @@ def test_ddp(args, compare_weights = False, train_flag = "flattened", comparison
         pass
         
     results.to_csv(file_name, index=False)
-    print(f"Results for batch_size={args.batch_size}, world_size={args.n_procs}:")
-    print(results.tail(1))
+    print(f"Finished for batch_size={args.batch_size}, world_size={args.n_procs}")
+
+    del naive_lm
 
     
 if __name__ == "__main__":
     # set all random seeds
     args = parse_args()
-    test_ddp(args, False, "flattened", "simplest")
+    args.n_procs = 2
+    args.model_size = "xl"
+    for batch_size in [2, 4, 8]:
+        args.batch_size = batch_size
+        test_ddp(args, False, "flattened", "simplest")

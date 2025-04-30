@@ -36,6 +36,7 @@ class BaseTrainer:
         """Base implementation of a single training step"""
         raise NotImplementedError("Subclasses must implement training_step")
 
+
 class NaiveDDPTrainer(BaseTrainer):
     """Naive DDP trainer"""
     def __init__(self, device, model_params, optimizer_params, n_procs: int, rank = None, backend = "nccl", jit_compile = True):
@@ -61,8 +62,8 @@ class NaiveDDPTrainer(BaseTrainer):
 
         # set up master address and port for multiprocessing
         master_addr = os.environ.get("MASTER_ADDR", "localhost")
-        # master_port = os.environ.get("MASTER_PORT", "29500")
-        master_port = os.environ.get("MASTER_PORT", str(random.randint(29500, 29600)))
+        master_port = os.environ.get("MASTER_PORT", "29500")
+        # master_port = os.environ.get("MASTER_PORT", str(random.randint(29500, 29600)))
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
 
@@ -113,6 +114,7 @@ class NaiveDDPTrainer(BaseTrainer):
 
         return full_step_end - full_start, collect_end - collect_start
 
+
 class FlattenedDDPTrainer(NaiveDDPTrainer):
     """Flattened DDP trainer"""
     def __init__(self, device, model_params, optimizer_params, n_procs: int, rank = None, backend = "nccl", jit_compile = True):
@@ -151,6 +153,7 @@ class FlattenedDDPTrainer(NaiveDDPTrainer):
         full_step_end = timeit.default_timer()
 
         return full_step_end - full_start, collect_end - collect_start
+
 
 class SimplestTrainer(BaseTrainer):
     """Sanity check simple trainer"""

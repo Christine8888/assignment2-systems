@@ -50,7 +50,7 @@ def submit_naive_ddp_benchmark():
 
     executor.update_parameters(name = "naive_ddp_benchmark", slurm_gpus_per_task=args.n_procs, slurm_partition = "a2", slurm_qos = "a2-qos")
 
-    for batch_size in [2, 4, 8, 16, 32, 64]:
+    for batch_size in [4, 8]:
         args.batch_size = batch_size
         job = executor.submit(benchmark_lm.test_ddp, args, compare_weights = False, train_flag = "naive")
         print(f"Submitted job for batch size {batch_size}")
