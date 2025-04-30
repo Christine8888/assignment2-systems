@@ -23,6 +23,8 @@ memory_profile = False
 jit_compile = False
 torch_profile = True
 
+DDP_FLAGS = ["naive", "flattened", "overlap", "bucket"]
+
 # if nvtx_profile:
 #    # only replace implementations if nvtx_profile is True
 #    model.scaled_dot_product_attention = model.annotated_scaled_dot_product_attention
@@ -38,7 +40,6 @@ def benchmark_loop(model_params: dict, optimizer_params: dict, train_params: dic
     device = train_params["device"] # note this will be overridden by the device in the trainer
 
     x_data, y_data = data.get_batch(dataset, batch_size = train_params["batch_size"], context_length = model_params["context_length"], device = device)
-
     lm = model.BasicsTransformerLM(**model_params).to(device)
     optim = optimizer.AdamW(lm.parameters(), **optimizer_params)
 
@@ -48,32 +49,27 @@ def benchmark_loop(model_params: dict, optimizer_params: dict, train_params: dic
     
     elif train_flag == "naive":
         trainer = ddp.NaiveDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], backend = "nccl", jit_compile = jit_compile)
-
-        x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
-        x_data = x_data.to(trainer.device)
-        y_data = y_data.to(trainer.device)
     
     elif train_flag == "flattened":
         trainer = ddp.FlattenedDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], backend = "nccl", jit_compile = jit_compile)
-
-        x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
-        x_data = x_data.to(trainer.device)
-        y_data = y_data.to(trainer.device)
     
     elif train_flag == "overlap":
         trainer = ddp.OverlapDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], backend = "nccl", jit_compile = jit_compile)
-        
-        x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
-        x_data = x_data.to(trainer.device)
-        y_data = y_data.to(trainer.device)
+
+    elif train_flag == "bucket":
+        trainer = ddp.BucketDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], bucket_size_mb = train_params["bucket_size_mb"], backend = "nccl", jit_compile = jit_compile)
 
     elif train_flag == "simplest":
-        # trainer = ddp.SimplestTrainer(device, model_params, optimizer_params, jit_compile = jit_compile)
         trainer = ddp.SimplestTrainer(device, lm, optim, jit_compile = jit_compile)
         
     else:
         raise ValueError(f"Invalid training flag: {train_flag}")
     
+    if train_flag in DDP_FLAGS:
+        x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
+        x_data = x_data.to(trainer.device)
+        y_data = y_data.to(trainer.device)
+
     # training and benchmarking loop
     all_times = []
     print(f"training for {n_steps} steps")
@@ -84,7 +80,7 @@ def benchmark_loop(model_params: dict, optimizer_params: dict, train_params: dic
     
     
     # get final model for comparison
-    if train_flag == "naive" or train_flag == "flattened" or train_flag == "overlap":
+    if train_flag in DDP_FLAGS:
         # synchronize all processes
         torch.distributed.barrier()
 
@@ -186,7 +182,7 @@ def run_train(args, train_flag = "vanilla"):
     adamw_params, train_params = get_default_dicts(args)
     dataset = np.random.randint(0, args.vocab_size, size = args.context_length * 10)
 
-    if train_flag == "naive" or train_flag == "flattened" or train_flag == "overlap":
+    if train_flag in DDP_FLAGS:
         shared = mp.Manager().dict()
         shared["all_times"] = []
         mp.spawn(ddp_worker, args = (args, adamw_params, train_params, dataset, shared, train_flag), nprocs = args.n_procs, join = True)
@@ -270,10 +266,10 @@ def test_ddp(args, test_weights = False, train_flag = "flattened", comparison_fl
 if __name__ == "__main__":
     # set all random seeds
     args = parse_args()
-    args.model_size = "xl"
+    args.model_size = "tiny"
     args.n_steps = 10
     args.n_procs = 2
-    test_ddp(args, False, "naive")
+    test_ddp(args, True, "bucket", "overlap")
 
     # code for running memory profiling
     # with profile(

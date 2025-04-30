@@ -229,23 +229,6 @@ class DDPOverlapBucket(DDPOverlapWrapper):
 
 class NaiveDDPTrainer(BaseTrainer):
     """Naive DDP trainer"""
-    # def __init__(self, device, model_params, optimizer_params, n_procs: int, rank = None, backend = "nccl", jit_compile = True):
-    #     self.n_procs = n_procs
-    #     self.jit_compile = jit_compile
-
-    #     if rank is None:
-    #         self.rank = int(os.environ.get("LOCAL_RANK", -1))
-    #     else:
-    #         self.rank = rank
-
-    #     self.setup(self.rank, self.n_procs, backend)
-
-    #     # initialize model, optimizer; device set already in setup
-    #     self.device = torch.device(f"cuda:{self.rank}")
-    #     super().init_model(model_params, self.device)
-    #     super().init_optimizer(optimizer_params)
-
-    #     self.param_sync()
     
     def __init__(self, device, model, optimizer, n_procs: int, rank = None, backend = "nccl", jit_compile = True):
         self.n_procs = n_procs
@@ -359,6 +342,13 @@ class OverlapDDPTrainer(NaiveDDPTrainer):
                 full_step_end = timeit.default_timer()
 
             return full_step_end - full_start, 0
+
+
+class BucketDDPTrainer(OverlapDDPTrainer):
+    """Bucket DDP trainer"""
+    def __init__(self, device, model, optimizer, n_procs: int, bucket_size_mb: float, rank = None, backend = "nccl", jit_compile = True):
+        super().__init__(device, model, optimizer, n_procs, rank, backend, jit_compile)
+        self.model = DDPOverlapBucket(self.model, bucket_size_mb)
 
 class FlattenedDDPTrainer(NaiveDDPTrainer):
     """Flattened DDP trainer"""
