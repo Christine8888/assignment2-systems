@@ -1,6 +1,7 @@
 import submitit
 import cs336_systems.benchmark_lm as benchmark_lm
 import sys
+from benchmark_comm import benchmark_comms
 
 def memory_benchmark(context_length: int, include_backward: bool, include_adam: bool, model_size: str, mixed_precision: bool):
     args = benchmark_lm.parse_args()
@@ -27,5 +28,12 @@ def submit_memory_benchmark():
             job = executor.submit(memory_benchmark, context_length, val, include_adam, model_size, mixed_precision)
             print(f"Submitted job for context length {context_length} and include_backward {val}")
 
+def submit_comm_benchmark():
+    executor = submitit.AutoExecutor(folder="comm_results")
+    executor.update_parameters(name = "comm_benchmark", gpus_per_task = 6, slurm_partition = "a2", slurm_qos = "a2-qos")
+    n_warmup = 5
+    n_steps = 20
+    executor.submit(benchmark_comms, "nccl", n_warmup, n_steps)
+
 if __name__ == "__main__":
-    submit_memory_benchmark()
+    submit_comm_benchmark()
