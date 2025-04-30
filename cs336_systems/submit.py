@@ -2,6 +2,7 @@ import submitit
 import cs336_systems.benchmark_lm as benchmark_lm
 import sys
 from benchmark_comm import benchmark_comms
+import torch
 
 def memory_benchmark(context_length: int, include_backward: bool, include_adam: bool, model_size: str, mixed_precision: bool):
     args = benchmark_lm.parse_args()
@@ -10,7 +11,8 @@ def memory_benchmark(context_length: int, include_backward: bool, include_adam: 
     args.include_adam = include_adam
     args.model_size = model_size
     args.mixed_precision = mixed_precision
-    benchmark_lm.main(args, save_times = False)
+    benchmark_lm.run_time(args, save_times = False)
+
 
 def submit_memory_benchmark():
     executor = submitit.AutoExecutor(folder="memory_results")
@@ -28,12 +30,31 @@ def submit_memory_benchmark():
             job = executor.submit(memory_benchmark, context_length, val, include_adam, model_size, mixed_precision)
             print(f"Submitted job for context length {context_length} and include_backward {val}")
 
+
 def submit_comm_benchmark():
     executor = submitit.AutoExecutor(folder="comm_results")
-    executor.update_parameters(name = "comm_benchmark", gpus_per_task = 6, slurm_partition = "a2", slurm_qos = "a2-qos")
+    executor.update_parameters(name = "comm_benchmark", slurm_gpus_per_task=6, slurm_partition = "a2", slurm_qos = "a2-qos")
     n_warmup = 5
+    backend = "nccl"
     n_steps = 20
-    executor.submit(benchmark_comms, "nccl", n_warmup, n_steps)
+
+    job = executor.submit(benchmark_comms, backend, n_warmup, n_steps)
+
+def submit_naive_ddp_benchmark():
+    executor = submitit.AutoExecutor(folder="naive_ddp_results")
+    args = benchmark_lm.parse_args()
+    args.n_procs = 2
+    args.warmup = 5
+    args.n_steps = 20
+    args.model_size = "xl"
+
+    executor.update_parameters(name = "naive_ddp_benchmark", slurm_gpus_per_task=args.n_procs, slurm_partition = "a2", slurm_qos = "a2-qos")
+
+    for batch_size in [2, 4, 8, 16, 32, 64]:
+        args.batch_size = batch_size
+        job = executor.submit(benchmark_lm.test_ddp, args, compare_weights = False, train_flag = "naive")
+        print(f"Submitted job for batch size {batch_size}")
+
 
 if __name__ == "__main__":
-    submit_comm_benchmark()
+    submit_naive_ddp_benchmark()

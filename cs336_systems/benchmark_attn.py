@@ -9,6 +9,7 @@ BATCH_SIZE = 8
 NUM_HEADS = 1
 device = torch.device("cuda")
 jit_compile = False
+
 def benchmark(d_model: int, seq_len: int, warmup: int = 10, steps: int = 100):
     # create random inputs
     Q = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, d_model, device=device, requires_grad=True)

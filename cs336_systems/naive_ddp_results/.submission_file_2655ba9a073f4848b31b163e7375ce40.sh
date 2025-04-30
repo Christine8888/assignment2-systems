@@ -1,0 +1,1 @@
+/home/c-cye/assignment2-systems/cs336_systems/naive_ddp_results/23563_submission.sh

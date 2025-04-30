@@ -6,6 +6,8 @@ test_results.xml
 cs336_systems/memory_results
 cs336_systems/time_results
 cs336_systems/nvtx_results
+cs336_systems/comm_results
+cs336_systems/naive_ddp_results
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
