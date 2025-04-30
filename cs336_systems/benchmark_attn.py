@@ -1,33 +1,25 @@
 import torch
-from cs336_basics.model import scaled_dot_product_attention
+from cs336_systems.flash_attn import TritonAttention, TorchAttention
 import pandas as pd
 import timeit
 import einx
 
 BATCH_SIZE = 8
 NUM_HEADS = 1
-device = 'cuda'
-jit_compile = True
-
-if jit_compile:
-    scaled_dot_product_attention = torch.compile(scaled_dot_product_attention)
-    print("JIT compiled scaled_dot_product_attention")
 
 def benchmark(d_model: int, seq_len: int, warmup: int = 10, steps: int = 100):
-    # Q, K, V have size batch_size x seq_len x d_model
     # create random inputs
     Q = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, d_model, device=device, requires_grad=True)
     K = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, d_model, device=device, requires_grad=True)
     V = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, d_model, device=device, requires_grad=True)
 
-    # create (simple) causal mask
+    # create causal mask
     seq = torch.arange(seq_len, device=device)
     qi = einx.rearrange('query -> 1 1 query 1', seq)
     kj = einx.rearrange('key   -> 1 1 1   key', seq)
     causal_mask = qi >= kj  # (query, key)
 
-    # stand-in gradients
-
+    # run warmup steps
     for _ in range(warmup):
         attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
         torch.cuda.synchronize()
@@ -41,27 +33,33 @@ def benchmark(d_model: int, seq_len: int, warmup: int = 10, steps: int = 100):
         
         torch.cuda.empty_cache()
     
+    # record forward and backward times
     forward_time = 0
     backward_time = 0
     pre_back_memory = 0
     
+    # run actual steps
     for _ in range(steps):
-        start_time = timeit.default_timer()
+        # measure forward pass
+        forward_start_time = timeit.default_timer()
         attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
         torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        forward_time += (end_time - start_time)
+        forward_end_time = timeit.default_timer()
+        forward_time += (forward_end_time - forward_start_time)
 
+        # measure memory usage before backward pass
         memory = torch.cuda.memory_allocated() / 1024**2 # get it in GB
         pre_back_memory += memory
 
-        start_time = timeit.default_timer()
+        # measure backward pass
+        backward_start_time = timeit.default_timer()
         gradient = torch.ones_like(attn_output, device=device)
         attn_output.backward(gradient)
         torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        backward_time += (end_time - start_time)
+        backward_end_time = timeit.default_timer()
+        backward_time += (backward_end_time - backward_start_time)
 
+        # reset gradients
         for param in [Q, K, V]:
             param.grad.zero_()
         
