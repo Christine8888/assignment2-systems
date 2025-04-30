@@ -220,6 +220,7 @@ def test_ddp(args, test_weights = False, train_flag = "flattened", comparison_fl
     """Test DDP training accuracy by parameter comparison to a non-DDP training run."""
     set_seeds()
     collect_times_ddp, time_per_step_ddp, data_ddp, ddp_lm = run_train(args, train_flag = train_flag)
+    ddp_lm = ddp_lm.cpu()
 
     if test_weights:
         set_seeds()
@@ -266,27 +267,15 @@ def test_ddp(args, test_weights = False, train_flag = "flattened", comparison_fl
 if __name__ == "__main__":
     # set all random seeds
     args = parse_args()
-    args.model_size = "tiny"
+    args.model_size = "xl"
     args.n_steps = 10
     args.n_procs = 2
-    test_ddp(args, True, "bucket", "overlap")
 
-    # code for running memory profiling
-    # with profile(
-    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    #     with_stack=True,
-    #     profile_memory=True,
-    #     record_shapes=True,
-    #     with_flops=True
-    # ) as prof:
-    #    
-
-    # test_ddp(args, False, "overlap")
-    # test_ddp(args, False, "naive")
-
-    # prof.export_chrome_trace("overlap_ddp.json")
+    # result is just never correct regardless of bucket size
+    # if n_procs is 1, result is correct
+    # test_ddp(args, True, "bucket", "naive")
 
     # code for running benchmarking
-    # for batch_size in [2, 4, 8, 16]:
-    #     args.batch_size = batch_size
-    #     test_ddp(args, False, "overlap")
+    for batch_size in [2, 4, 8, 16]:
+        args.batch_size = batch_size
+        test_ddp(args, False, "overlap")

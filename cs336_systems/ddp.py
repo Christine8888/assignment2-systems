@@ -21,12 +21,6 @@ def nvtx_range(name):
         return nullcontext()
 
 class BaseTrainer:
-    # def __init__(self, device, model_params, optimizer_params, jit_compile = True):
-    #     self.device = device
-    #     self.jit_compile = jit_compile
-    #     self.init_model(model_params, self.device)
-    #     self.init_optimizer(optimizer_params)
-    
     def __init__(self, device, model, optimizer, jit_compile = True):
         self.model = model
         self.optimizer = optimizer
@@ -96,7 +90,8 @@ class DDPOverlapWrapper(nn.Module):
 
         for param in self.module.parameters():
             if param.requires_grad:
-                param.register_hook(self.make_hook(param))
+                # param.register_hook(self.make_hook(param))
+                param.register_post_accumulate_grad_hook(self.make_hook(param))
         
         self.param_sync()
 
@@ -104,14 +99,15 @@ class DDPOverlapWrapper(nn.Module):
     
     def make_hook(self, param):
         @unserializable_hook
-        def hook(grad):
-            if not grad.is_contiguous():
-                grad = grad.contiguous()
-            handle = dist.all_reduce(grad, op=dist.ReduceOp.SUM, async_op=False)
-            return grad
+        def hook(param):
+            # for some reason, making this async causes failures -- why?
+            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+            # handle.wait()
+            self.handles.append(handle)
+            # return grad
         
         return hook
-
+    
     def param_sync(self):
         for param in self.module.parameters():
             dist.broadcast(param.data, src = 0)
@@ -124,40 +120,52 @@ class DDPOverlapWrapper(nn.Module):
         # print(f"Synchronizing gradients for rank {self.rank}")
 
         for handle in self.handles:
-            handle.wait()
+            if handle is not None:
+                handle.wait()
         
         # scale gradients
         for param in self.module.parameters():
-            if param.grad is not None and param.requires_grad:
+            if param.grad is not None:
                 param.grad.div_(self.world_size)
         
         self.handles.clear()
 
-class DDPOverlapBucket(DDPOverlapWrapper):
+class DDPOverlapBucket(nn.Module):
     def __init__(self, module: torch.nn.Module, bucket_size_mb: float):
-        super().__init__(module)
+        super().__init__()
+        self.module = module
         self.bucket_size = bucket_size_mb
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
         self.buckets = []
         self.pending_in_bucket = []
         self.handles = []
+        self.param_sync()
         self.assign_buckets()
         self.register_bucket_hooks()
     
+    def param_sync(self):
+        for param in self.module.parameters():
+            dist.broadcast(param.data, src = 0)
+
     def assign_buckets(self):
         # assign parameters into buckets in reverse order of model.parameters()
         current_bucket = []
         current_size = 0
+
         for param in reversed(list(self.module.parameters())):
-            if param.requires_grad:
-                size_mb = param.numel() * param.element_size() / 1024**2
-                
-                if current_size + size_mb > self.bucket_size:
-                    self.buckets.append(current_bucket)
-                    current_bucket = []
-                    current_size = 0
-                
-                current_bucket.append(param)
-                current_size += size_mb
+            if not param.requires_grad:
+                continue
+            
+            size_mb = param.numel() * param.element_size() / 1024**2
+            
+            if current_size + size_mb > self.bucket_size:
+                self.buckets.append(current_bucket)
+                current_bucket = []
+                current_size = 0
+            
+            current_bucket.append(param)
+            current_size += size_mb
         
         self.buckets.append(current_bucket)
 
@@ -167,63 +175,81 @@ class DDPOverlapBucket(DDPOverlapWrapper):
             
             for p in bucket:
                 p.bucket_idx = idx
+            
+        print(f'created {len(self.buckets)} buckets')
     
     def register_bucket_hooks(self):
         for p in self.module.parameters():
             if not p.requires_grad:
                 continue
                 
-            p.register_hook(self.make_bucket_hook(p))
+            p.register_post_accumulate_grad_hook(self.make_bucket_hook())
     
-    def make_bucket_hook(self, p):
+    def make_bucket_hook(self):
         @unserializable_hook
-        def hook(grad):
-            if grad is None:
-                return
-            
-            bucket_idx = p.bucket_idx
+        def hook(param):
+            bucket_idx = param.bucket_idx
             self.pending_in_bucket[bucket_idx] += 1
 
             if self.pending_in_bucket[bucket_idx] == len(self.buckets[bucket_idx]):
                 self.pending_in_bucket[bucket_idx] = 0 # reset 
                 handle = self.reduce_bucket(bucket_idx)
-                
-                if handle is not None:
-                    self.handles.append(handle)
-            
-            return grad
+
+                # self.handles.append(handle)
         
         return hook
     
     def reduce_bucket(self, bucket_idx):
+        print('reducing bucket', bucket_idx)
         bucket = self.buckets[bucket_idx]
         source_grads = [param.grad for param in bucket if param.grad is not None]
+        source_params = [param for param in bucket if param.grad is not None]
+        
+        for param in source_params:
+            param.reduced = True
 
         if source_grads:
+            # naive_grads = [grad.clone().detach() for grad in source_grads]
+            # for grad in naive_grads:
+            #     dist.all_reduce(grad, op=dist.ReduceOp.SUM, async_op = True)
+            #     grad.div_(self.world_size)
+
             flattened = torch._utils._flatten_dense_tensors(source_grads)
-            handle = dist.all_reduce(flattened, op=dist.ReduceOp.SUM)
-            flattened.div_(self.world_size)
+            handle = dist.all_reduce(flattened, op=dist.ReduceOp.SUM, async_op = True)
             
-            # update with unflattened gradients
-            unflattened = torch._utils._unflatten_dense_tensors(flattened, source_grads)
-            for param, unflattened_grad in zip(bucket, unflattened):
-                # set gradients
-                param.grad = unflattened_grad
+            # for naive_grad, grad in zip(naive_grads, unflattened):
+            #     if not torch.allclose(naive_grad, grad):
+            #         print('naive and flattened grads are different')
+            #         print('max diff', torch.max(torch.abs(naive_grad - grad)))
             
+            self.handles.append((handle, flattened, bucket_idx))
             return handle
         
         return None
 
     def forward(self, *inputs, **kwargs):
+        for param in self.module.parameters():
+            param.reduced = False
+
         return self.module(*inputs, **kwargs)
     
     def finish_gradient_synchronization(self):
-        for handle in self.handles:
+        for handle, flattened, bucket_idx in self.handles:
             handle.wait()
+
+            flattened.div_(self.world_size)
+            bucket_grads = [p.grad for p in self.buckets[bucket_idx] if p.grad is not None]
+            bucket_params = [p for p in self.buckets[bucket_idx] if p.grad is not None]
+            unflattened = torch._utils._unflatten_dense_tensors(flattened, bucket_grads)
+
+            for param, updated_grad in zip(bucket_params, unflattened):
+                param.grad.copy_(updated_grad)
         
-        for bucket in self.buckets:
-            for param in bucket:
-                param.grad.div_(self.world_size)
+        for param in self.module.parameters():
+            if not param.reduced and param.grad is not None:
+                print('param not reduced')
+                
+                param.reduced = False
         
         self.handles.clear()
 
@@ -297,6 +323,7 @@ class NaiveDDPTrainer(BaseTrainer):
                 for param in self.model.parameters():
                     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
                     param.grad.div_(self.n_procs)
+
                 
                 torch.cuda.synchronize()
                 dist.barrier()
@@ -334,6 +361,8 @@ class OverlapDDPTrainer(NaiveDDPTrainer):
             # sync gradients across processes
             with nvtx_range("gradient synchronization"):
                 self.model.finish_gradient_synchronization()
+            
+            dist.barrier()
 
             # optimizer step
             with nvtx_range("optimizer step"):
@@ -342,7 +371,6 @@ class OverlapDDPTrainer(NaiveDDPTrainer):
                 full_step_end = timeit.default_timer()
 
             return full_step_end - full_start, 0
-
 
 class BucketDDPTrainer(OverlapDDPTrainer):
     """Bucket DDP trainer"""
@@ -371,14 +399,15 @@ class FlattenedDDPTrainer(NaiveDDPTrainer):
 
         # sync gradients across processes, with flattening
         collect_start = timeit.default_timer()
-        source_grads = [param.grad for param in self.model.parameters()]
+        source_grads = [param.grad for param in self.model.parameters() if param.grad is not None]
+        source_params = [param for param in self.model.parameters() if param.grad is not None]
         flattened = torch._utils._flatten_dense_tensors(source_grads)
         dist.all_reduce(flattened, op=dist.ReduceOp.SUM)
         flattened.div_(self.n_procs)
         
         # update with unflattened gradients
         unflattened = torch._utils._unflatten_dense_tensors(flattened, source_grads)
-        for param, unflattened_grad in zip(self.model.parameters(), unflattened):
+        for param, unflattened_grad in zip(source_params, unflattened):
             param.grad = unflattened_grad
             
         torch.cuda.synchronize()

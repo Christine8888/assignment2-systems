@@ -2,6 +2,7 @@ import argparse
 import torch
 
 MODEL_SIZES = {
+    "tiniest": {"d_model": 4, "num_layers": 1, "num_heads": 1, "d_ff": 16},
     "tiny": {"d_model": 64, "num_layers": 12, "num_heads": 4, "d_ff": 256},
     "small": {"d_model": 768, "num_layers": 12, "num_heads": 12, "d_ff": 3072},
     "medium": {"d_model": 1024, "num_layers": 24, "num_heads": 16, "d_ff": 4096},

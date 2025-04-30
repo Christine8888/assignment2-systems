@@ -5,6 +5,7 @@ from typing import Type
 import torch
 import cs336_systems.flash_attn as flash_attn
 from cs336_systems.ddp import DDPOverlapWrapper, DDPOverlapBucket
+import cs336_systems.optimizer_sharding as optimizer_sharding
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
@@ -137,4 +138,4 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return optimizer_sharding.ShardedOptimizer(params, optimizer_cls, **kwargs)
