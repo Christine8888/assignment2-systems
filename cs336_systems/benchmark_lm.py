@@ -12,44 +12,26 @@ import random
 import torch.multiprocessing as mp
 import os
 import torch.distributed as dist
-nvtx_profile = False
+from torch.profiler import profile, record_function, ProfilerActivity
+from benchmark_utils import parse_args, get_default_dicts, MODEL_SIZES, get_sharded_batch
+
+nvtx_profile = True
 ddp.nvtx_profile = nvtx_profile
 nvtx_range = ddp.nvtx_range
 
 memory_profile = False
 jit_compile = False
+torch_profile = True
 
-if nvtx_profile:
-    # only replace implementations if nvtx_profile is True
-    model.scaled_dot_product_attention = model.annotated_scaled_dot_product_attention
-    model.CausalMultiHeadSelfAttention.forward = model.CausalMultiHeadSelfAttention.annotated_forward
-
-MODEL_SIZES = {
-    "small": {"d_model": 768, "num_layers": 12, "num_heads": 12, "d_ff": 3072},
-    "medium": {"d_model": 1024, "num_layers": 24, "num_heads": 16, "d_ff": 4096},
-    "large": {"d_model": 1280, "num_layers": 36, "num_heads": 20, "d_ff": 5120},
-    "xl": {"d_model": 1600, "num_layers": 48, "num_heads": 25, "d_ff": 6400},
-    "2.7B": {"d_model": 2560, "num_layers": 32, "num_heads": 32, "d_ff": 10240},
-}
+# if nvtx_profile:
+#    # only replace implementations if nvtx_profile is True
+#    model.scaled_dot_product_attention = model.annotated_scaled_dot_product_attention
+#    model.CausalMultiHeadSelfAttention.forward = model.CausalMultiHeadSelfAttention.annotated_forward
 
 def set_seeds():
     torch.manual_seed(0)
     np.random.seed(0)
     # random.seed(0)
-
-def get_sharded_batch(x_data, y_data, batch_size, n_procs, rank):
-    # shard data across processes
-    shard_size = int(batch_size / n_procs)
-    print(f"shard_size: {shard_size}")
-
-    # check that it divides evenly
-    assert batch_size % n_procs == 0
-
-    # shard data
-    x_shard = x_data[rank * shard_size:(rank + 1) * shard_size]
-    y_shard = y_data[rank * shard_size:(rank + 1) * shard_size]
-
-    return x_shard, y_shard
 
 def benchmark_loop(model_params: dict, optimizer_params: dict, train_params: dict, dataset: np.array, warmup: int, n_steps: int, model_size: str, train_flag: str = "vanilla"):
     memory_flag = "full" if train_params["include_backward"] else "forward" if memory_profile else None
@@ -57,109 +39,59 @@ def benchmark_loop(model_params: dict, optimizer_params: dict, train_params: dic
 
     x_data, y_data = data.get_batch(dataset, batch_size = train_params["batch_size"], context_length = model_params["context_length"], device = device)
 
+    lm = model.BasicsTransformerLM(**model_params).to(device)
+    optim = optimizer.AdamW(lm.parameters(), **optimizer_params)
+
     # initialize trainer and data
     if train_flag == "vanilla":
-        trainer = ddp.VanillaTrainer(device, model_params, optimizer_params, 
-                                    mixed_precision = train_params["mixed_precision"], 
-                                    amp_dtype = train_params["amp_dtype"],
-                                    memory_flag = memory_flag,
-                                    jit_compile = jit_compile)
+        trainer = ddp.VanillaTrainer(device, lm, optim, jit_compile = jit_compile)
     
     elif train_flag == "naive":
-        # if naive, "backward time" includes only gradient syncing time
-        trainer = ddp.NaiveDDPTrainer(device, model_params, optimizer_params, 
-                                    n_procs = train_params["n_procs"],
-                                    backend = "nccl",
-                                    jit_compile = jit_compile)
+        trainer = ddp.NaiveDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], backend = "nccl", jit_compile = jit_compile)
+
         x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
         x_data = x_data.to(trainer.device)
         y_data = y_data.to(trainer.device)
     
     elif train_flag == "flattened":
-        trainer = ddp.FlattenedDDPTrainer(device, model_params, optimizer_params, 
-                                    n_procs = train_params["n_procs"],
-                                    backend = "nccl",
-                                    jit_compile = jit_compile)
+        trainer = ddp.FlattenedDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], backend = "nccl", jit_compile = jit_compile)
+
         x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
         x_data = x_data.to(trainer.device)
         y_data = y_data.to(trainer.device)
+    
+    elif train_flag == "overlap":
+        trainer = ddp.OverlapDDPTrainer(device, lm, optim, n_procs = train_params["n_procs"], backend = "nccl", jit_compile = jit_compile)
         
+        x_data, y_data = get_sharded_batch(x_data, y_data, train_params["batch_size"], train_params["n_procs"], trainer.rank)
+        x_data = x_data.to(trainer.device)
+        y_data = y_data.to(trainer.device)
+
     elif train_flag == "simplest":
-        trainer = ddp.SimplestTrainer(device, model_params, optimizer_params, jit_compile = jit_compile)
+        # trainer = ddp.SimplestTrainer(device, model_params, optimizer_params, jit_compile = jit_compile)
+        trainer = ddp.SimplestTrainer(device, lm, optim, jit_compile = jit_compile)
         
     else:
         raise ValueError(f"Invalid training flag: {train_flag}")
     
     # training and benchmarking loop
     all_times = []
-    
     print(f"training for {n_steps} steps")
     for i in range(n_steps + warmup):
-        print(f"training step {i}")
         times = trainer.training_step(x_data, y_data)
         if i > warmup:
             all_times.append(times)
     
+    
     # get final model for comparison
-    if train_flag == "naive" or train_flag == "flattened":
+    if train_flag == "naive" or train_flag == "flattened" or train_flag == "overlap":
         # synchronize all processes
         torch.distributed.barrier()
 
     final_model = trainer.model
 
     return final_model, all_times
-    
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--vocab_size", type=int, default=10000)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--d_model", type=int, default=512)
-    parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--d_ff", type=int, default=2048)
-    parser.add_argument("--n_layers", type=int, default=6)
-    parser.add_argument("--context_length", type=int, default=512)
-    parser.add_argument("--rope_theta", type=float, default=10000)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--n_steps", type=int, default=10)
-    parser.add_argument("--include_backward", default=False, action="store_true")
-    parser.add_argument("--model_size", type=str, default="all")
-    parser.add_argument("--mixed_precision", default=False, action="store_true")
-    parser.add_argument("--amp_dtype", type=str, default="bfloat16")
-    parser.add_argument("--n_procs", type=int, default=1)
-    
-    args, _ = parser.parse_known_args()
-    return args
 
-def get_default_dicts(args):
-    adamw_params = {
-        "lr": 1e-3,
-        "betas": (0.9, 0.95),
-        "eps": 1e-8,
-        "weight_decay": 0.1,
-    }
-
-    # check if already a torch dtype
-    if isinstance(args.amp_dtype, torch.dtype):
-        pass
-    elif args.amp_dtype == "bfloat16":
-        amp_dtype = torch.bfloat16
-    elif args.amp_dtype == "float16":
-        args.amp_dtype = torch.float16
-    else:
-        raise ValueError(f"Invalid AMP dtype: {args.amp_dtype}")
-
-    train_params = {
-        "model_size": args.model_size,
-        "batch_size": args.batch_size,
-        "device": args.device,
-        "include_backward": args.include_backward,
-        "mixed_precision": args.mixed_precision,
-        "amp_dtype": args.amp_dtype,
-        "n_procs": args.n_procs,
-    }
-
-    return adamw_params, train_params
 
 def launch_model(args, adamw_params, train_params, dataset, train_flag = "vanilla"):
     model_size = train_params["model_size"]
@@ -184,6 +116,10 @@ def launch_model(args, adamw_params, train_params, dataset, train_flag = "vanill
     return lm, all_times
 
 def run_time(args, dataset, save_times = False, to_save = ["forward_mean", "forward_std", "backward_mean", "backward_std"]):
+    """
+    Run forward/backward pass timings for a given model size and save the results to a csv file.
+    """
+
     adamw_params, train_params = get_default_dicts(args)
 
     # create pandas dataframe to store results for each model size
@@ -220,28 +156,39 @@ def run_time(args, dataset, save_times = False, to_save = ["forward_mean", "forw
 def ddp_worker(rank, args, adamw_params, train_params, dataset, shared, train_flag):
     print('running ddp_worker with train_flag:', train_flag, 'and n_procs:', args.n_procs)
     os.environ["LOCAL_RANK"] = str(rank)
+    
     # must set seeds here, otherwise will get different results on different processes
     set_seeds()
     
     # run training loop
     final_model, all_times = launch_model(args = args, adamw_params = adamw_params, train_params = train_params, dataset = dataset, train_flag = train_flag)
-    
+
     # only let rank 0 return the real payload
     if rank == 0:
         cpu_final_model = final_model.cpu()
         shared["final_model"] = cpu_final_model
-        shared["all_times"] = all_times
+    
+        # append all_times to shared["all_times"]
+        current_list = shared["all_times"]
+        current_list.extend(all_times)
+        shared["all_times"] = current_list
     
     dist.destroy_process_group()
     
     
 def run_train(args, train_flag = "vanilla"):
+    """
+    Run training loop for a given model and distributed training strategy, and save the results to a CSV file.
+    """
+
     print('running run_train with train_flag:', train_flag, 'and n_procs:', args.n_procs)
+
     adamw_params, train_params = get_default_dicts(args)
     dataset = np.random.randint(0, args.vocab_size, size = args.context_length * 10)
 
-    if train_flag == "naive" or train_flag == "flattened":
+    if train_flag == "naive" or train_flag == "flattened" or train_flag == "overlap":
         shared = mp.Manager().dict()
+        shared["all_times"] = []
         mp.spawn(ddp_worker, args = (args, adamw_params, train_params, dataset, shared, train_flag), nprocs = args.n_procs, join = True)
         final_model = shared["final_model"]
         all_times = shared["all_times"]
@@ -256,46 +203,52 @@ def run_train(args, train_flag = "vanilla"):
 
     return collect_times, time_per_step, dataset, final_model
 
-def test_ddp(args, compare_weights = False, train_flag = "flattened", comparison_flag = "simplest"):
-    print('running test_ddp')
-    set_seeds()
-    collect_times_naive, time_per_step_naive, data_naive, naive_lm = run_train(args, train_flag = train_flag)
-    print('finished training')
+def compare_weights(vanilla_lm, naive_lm):
+    """
+    Compare the weights of two models.
+    """
+    all_match = True
+    for i, (param, naive_param) in enumerate(zip(vanilla_lm.parameters(), naive_lm.parameters())):
+        if not torch.allclose(param, naive_param, rtol=1e-4, atol=1e-5):
+            diff = (param - naive_param).abs()
+            print(f"❌ Parameter {i} mismatch:")
+            print(f"   Max diff: {diff.max().item()}")
+            print(f"   Mean diff: {diff.mean().item()}")
+            print(f"   Vanilla param stats: min={param.min().item()}, max={param.max().item()}")
+            print(f"   DDP param stats: min={naive_param.min().item()}, max={naive_param.max().item()}")
+            all_match = False
+    
+    return all_match
 
-    if compare_weights:
+def test_ddp(args, test_weights = False, train_flag = "flattened", comparison_flag = "simplest"):
+    """Test DDP training accuracy by parameter comparison to a non-DDP training run."""
+    set_seeds()
+    collect_times_ddp, time_per_step_ddp, data_ddp, ddp_lm = run_train(args, train_flag = train_flag)
+
+    if test_weights:
         set_seeds()
         collect_times_vanilla, time_per_step_vanilla, data_vanilla, vanilla_lm = run_train(args, train_flag = comparison_flag)
         vanilla_lm = vanilla_lm.cpu()
         
         # check same data, print with fun checkmark
-        assert np.allclose(data_vanilla, data_naive)
+        assert np.allclose(data_vanilla, data_ddp)
         print("✅ same data")
 
         # check same weights
-        all_match = True
-        for i, (param, naive_param) in enumerate(zip(vanilla_lm.parameters(), naive_lm.parameters())):
-            if not torch.allclose(param, naive_param, rtol=1e-4, atol=1e-5):
-                diff = (param - naive_param).abs()
-                print(f"❌ Parameter {i} mismatch:")
-                print(f"   Max diff: {diff.max().item()}")
-                print(f"   Mean diff: {diff.mean().item()}")
-                print(f"   Vanilla param stats: min={param.min().item()}, max={param.max().item()}")
-                print(f"   DDP param stats: min={naive_param.min().item()}, max={naive_param.max().item()}")
-                all_match = False
-    
+        all_match = compare_weights(vanilla_lm, ddp_lm)
         if all_match:
             print("✅ same weights")
         else:
             print("❌ weights differ")
 
         del vanilla_lm
-    
 
+    # save results to CSV
     results = pd.DataFrame({
             "batch_size": [args.batch_size],
             "world_size": [args.n_procs],
-            "avg. collection time (ms)": [np.mean(collect_times_naive) * 1000],
-            "avg. time per step (ms)": [np.mean(time_per_step_naive) * 1000]
+            "avg. collection time (ms)": [np.mean(collect_times_ddp) * 1000],
+            "avg. time per step (ms)": [np.mean(time_per_step_ddp) * 1000]
     })
     
     # append to existing file if it exists
@@ -311,14 +264,33 @@ def test_ddp(args, compare_weights = False, train_flag = "flattened", comparison
     results.to_csv(file_name, index=False)
     print(f"Finished for batch_size={args.batch_size}, world_size={args.n_procs}")
 
-    del naive_lm
+    del ddp_lm
 
     
 if __name__ == "__main__":
     # set all random seeds
     args = parse_args()
-    args.n_procs = 2
     args.model_size = "xl"
-    for batch_size in [2, 4, 8]:
-        args.batch_size = batch_size
-        test_ddp(args, False, "flattened", "simplest")
+    args.n_steps = 10
+    args.n_procs = 2
+    test_ddp(args, False, "naive")
+
+    # code for running memory profiling
+    # with profile(
+    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #     with_stack=True,
+    #     profile_memory=True,
+    #     record_shapes=True,
+    #     with_flops=True
+    # ) as prof:
+    #    
+
+    # test_ddp(args, False, "overlap")
+    # test_ddp(args, False, "naive")
+
+    # prof.export_chrome_trace("overlap_ddp.json")
+
+    # code for running benchmarking
+    # for batch_size in [2, 4, 8, 16]:
+    #     args.batch_size = batch_size
+    #     test_ddp(args, False, "overlap")

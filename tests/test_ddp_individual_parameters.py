@@ -142,6 +142,8 @@ def _test_DistributedDataParallelIndividualParameters(rank: int, world_size: int
             for non_parallel_model_parameter, ddp_model_parameter in zip(
                 non_parallel_model.parameters(), ddp_model.parameters()
             ):
+                # print maximum absolute difference
+                print(f"Maximum absolute difference: {torch.max(torch.abs(non_parallel_model_parameter - ddp_model_parameter))}")
                 assert torch.allclose(non_parallel_model_parameter, ddp_model_parameter)
 
         # Shuffle the data so that during the next iteration, each DDP rank sees a different set of inputs.

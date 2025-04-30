@@ -52,7 +52,7 @@ def submit_naive_ddp_benchmark():
 
     for batch_size in [4, 8]:
         args.batch_size = batch_size
-        job = executor.submit(benchmark_lm.test_ddp, args, compare_weights = False, train_flag = "naive")
+        job = executor.submit(benchmark_lm.test_ddp, args, test_weights = False, train_flag = "naive")
         print(f"Submitted job for batch size {batch_size}")
 
 
