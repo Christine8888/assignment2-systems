@@ -1,1 +1,5 @@
-batch_size,world_size,avg. collection time (ms),avg. time per step (ms)
+batch_size,world_size,avg. collection time (ms),avg. time per step (ms),bucket_size_mb
+,2,0.0,186.32389734395676,100.0
+2.0,2,0.0,355.8854731317196,
+4.0,2,0.0,546.3359920411475,
+8.0,2,0.0,879.1821711024063,

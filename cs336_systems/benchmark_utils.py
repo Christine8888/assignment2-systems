@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--amp_dtype", type=str, default="bfloat16")
     parser.add_argument("--n_procs", type=int, default=1)
     parser.add_argument("--bucket_size_mb", type=float, default=100)
+    parser.add_argument("--shard_optimizer", default=False, action="store_true")
+
     args, _ = parser.parse_known_args()
     return args
 
@@ -74,6 +76,7 @@ def get_default_dicts(args):
         "amp_dtype": args.amp_dtype,
         "n_procs": args.n_procs,
         "bucket_size_mb": args.bucket_size_mb,
+        "shard_optimizer": args.shard_optimizer,
     }
 
     return adamw_params, train_params

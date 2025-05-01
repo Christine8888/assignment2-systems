@@ -20,6 +20,7 @@ class ShardedOptimizer(torch.optim.Optimizer):
         # get world size and rank from dist
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
+        print(f"ShardedOptimizer: world_size: {self.world_size}, rank: {self.rank}")
         
         # parent constructor with empty parameter group
         self.optim = None

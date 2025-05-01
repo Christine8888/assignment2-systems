@@ -1,2 +1,0 @@
-batch_size,world_size,avg. collection time (ms),avg. time per step (ms)
-4,2,16.691651221157773,15.793963335454464
